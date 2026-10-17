@@ -14,7 +14,7 @@ function getClient() {
   }
   aiClient = new GoogleGenAI({
     apiKey,
-    httpOptions: { apiVersion: "", baseUrl },
+    httpOptions: { apiVersion: "v1beta", baseUrl },
   });
   return aiClient;
 }
