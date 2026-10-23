@@ -52,47 +52,73 @@ export async function createTempEmail(): Promise<TmailResult | null> {
     const domains = await getAvailableDomains();
     if (domains.length === 0) return null;
 
-    // Generate a mailbox — server picks email + password from the supplied domain list
+    const headers = {
+      "content-type": "application/json",
+      "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    };
+
+    // Phase 1: prepare — returns a capability token
+    const prepRes = await fetch(`${BASE}/api/mailbox/generate`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ phase: "prepare", domains }),
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!prepRes.ok) {
+      logger.warn(
+        { status: prepRes.status, body: await prepRes.text() },
+        "tmail.pk generate prepare failed"
+      );
+      return null;
+    }
+
+    const prepData = (await prepRes.json()) as { capability: string; phase: string };
+    if (!prepData.capability) {
+      logger.warn({ prepData }, "tmail.pk prepare returned no capability");
+      return null;
+    }
+
+    // Phase 2: commit — uses the capability to actually create the mailbox
     const genRes = await fetch(`${BASE}/api/mailbox/generate`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      },
-      body: JSON.stringify({ domains }),
+      headers,
+      body: JSON.stringify({ phase: "commit", capability: prepData.capability }),
       signal: AbortSignal.timeout(10_000),
     });
 
     if (!genRes.ok) {
-      logger.warn({ status: genRes.status, body: await genRes.text() }, "tmail.pk generate failed");
+      logger.warn(
+        { status: genRes.status, body: await genRes.text() },
+        "tmail.pk generate commit failed"
+      );
       return null;
     }
 
-    const { email, password } = (await genRes.json()) as { email: string; password: string };
-    if (!email || !password) return null;
+    const commitData = (await genRes.json()) as {
+      status: string;
+      email: string;
+      password: string;
+      token: string;
+      requestId: string;
+    };
 
-    // Get session token required for reading inbox
-    const sessionRes = await fetch(`${BASE}/api/mailbox/session`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      },
-      body: JSON.stringify({ email, password }),
-      signal: AbortSignal.timeout(10_000),
-    });
-
-    if (!sessionRes.ok) return null;
-    const { token } = (await sessionRes.json()) as { token: string };
-    if (!token) return null;
+    if (!commitData.email || !commitData.password) return null;
 
     const name = getRandomName();
-    return { email, password, token, name };
+    return {
+      email: commitData.email,
+      password: commitData.password,
+      token: commitData.token,
+      name,
+    };
   } catch (err) {
     logger.warn({ err }, "tmail.pk createTempEmail failed");
     return null;
   }
 }
+
+
 
 export async function getOTPFromMailTm(token: string, email: string): Promise<string | null> {
   try {
