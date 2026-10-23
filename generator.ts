@@ -7,6 +7,58 @@ const REG_URL = "https://dashboard.katabump.com/auth/register";
 const SITE_KEY = "0x4AAAAAAA1IssKDXD0TRMjP";
 const MAX_CONCURRENT_BROWSERS = 1;
 
+// ─── Proxy pool ─────────────────────────────────────────────────────────────
+// Every account-creation flow picks ONE random proxy from this pool and runs
+// the whole browser session through it, so all Katabump requests (page loads,
+// Turnstile, OTP, security-check captcha, form submit) originate from a
+// randomized IP. Retries in runJob() call createOneAccount() again, so each
+// retry naturally gets a fresh random IP as well.
+interface ProxyConfig {
+  label: string;
+  server: string;
+  username: string;
+  password: string;
+}
+
+const PROXY_SERVER = "http://dc.oxylabs.io:8000";
+const PROXIES: ProxyConfig[] = [
+  {
+    label: "oxylabs-1",
+    server: PROXY_SERVER,
+    username: "user-gsigis53875_oGmVP-country-US",
+    password: "I624pa5U1VP_RIOY",
+  },
+  {
+    label: "oxylabs-2",
+    server: PROXY_SERVER,
+    username: "user-benfeiproxy1_N3Vvw-country-US",
+    password: "Gdiyavaksg2usgshsi+",
+  },
+  {
+    label: "oxylabs-3",
+    server: PROXY_SERVER,
+    username: "user-benfeiproxy2_GR3FX-country-US",
+    password: "Oshhsuhe+7377gdid",
+  },
+  {
+    label: "oxylabs-4",
+    server: PROXY_SERVER,
+    username: "user-benfeiproxy3_EL6lL-country-US",
+    password: "Gsiyg+36uhdisuvs",
+  },
+  {
+    label: "oxylabs-5",
+    server: PROXY_SERVER,
+    username: "user-benfeiproxy4_RoMBf-country-US",
+    password: "hsoygssoyg+36gGs",
+  },
+];
+
+/** Pick a random proxy from the pool for one account-creation flow. */
+function pickProxy(): ProxyConfig {
+  return PROXIES[Math.floor(Math.random() * PROXIES.length)];
+}
+
 let activeBrowsers = 0;
 
 export interface Job {
@@ -65,6 +117,9 @@ async function createOneAccount(
   if (job.cancelRequested) return null;
   activeBrowsers++;
 
+  // Pick a random proxy for THIS account-creation flow only.
+  const proxy = pickProxy();
+
   try {
     appendLog(job, `[${index}/${total}] Creating temp email...`);
     const mailResult = await createTempEmail();
@@ -76,6 +131,7 @@ async function createOneAccount(
     const { email, token: mailToken, name } = mailResult;
     const password = genPassword();
     appendLog(job, `[${index}/${total}] 📧 ${email}`);
+    appendLog(job, `[${index}/${total}] 🌍 Proxy: ${proxy.label}`);
 
     // Use playwright-extra + stealth to bypass Cloudflare bot detection
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -94,6 +150,12 @@ async function createOneAccount(
 
     const browser = await chromiumExtra.launch({
       headless: true,
+      // Route the entire browser session through the randomly-picked proxy.
+      proxy: {
+        server: proxy.server,
+        username: proxy.username,
+        password: proxy.password,
+      },
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
@@ -122,7 +184,7 @@ async function createOneAccount(
       if (!refCode) {
         appendLog(job, `[${index}/${total}] 🔗 Visiting referral link...`);
         try {
-          await page.goto(refUrl, { timeout: 20_000, waitUntil: "domcontentloaded" });
+          await page.goto(refUrl, { timeout: 40_000, waitUntil: "domcontentloaded" });
           await new Promise((r) => setTimeout(r, 1_000));
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const hash: string = await page.evaluate(() => (globalThis as any).location?.hash ?? "");
@@ -136,7 +198,7 @@ async function createOneAccount(
       // Load the register page WITH the ref hash so its JS sets the referral cookie
       appendLog(job, `[${index}/${total}] 🌐 Loading registration page...`);
       await page.goto(`${REG_URL}${refCode ? "#" + refCode : ""}`, {
-        timeout: 20_000,
+        timeout: 40_000,
         waitUntil: "domcontentloaded",
       });
       await new Promise((r) => setTimeout(r, 600));
@@ -229,7 +291,7 @@ async function createOneAccount(
       // retrying with a fresh captcha (page reload / Regenerate) on a misread.
       let securityCheck = false;
       try {
-        await page.waitForSelector("#captcha_code", { timeout: 12_000 });
+        await page.waitForSelector("#captcha_code", { timeout: 20_000 });
         securityCheck = true;
       } catch {
         // No security check — older flow, account already created
