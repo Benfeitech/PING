@@ -97,6 +97,60 @@ function appendLog(job: Job, line: string): void {
   job.logs.push(line);
 }
 
+/**
+ * Wait up to `timeoutMs` for Cloudflare's Turnstile widget to solve natively.
+ * Native solve is best because the token is bound to the SAME IP / UA / session
+ * as the form submission. Returns the token, or null if the widget never filled
+ * the hidden field in time.
+ */
+async function waitForNativeTurnstile(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  page: any,
+  timeoutMs: number,
+): Promise<string | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const token = await page.evaluate(() => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const doc = (globalThis as any).document;
+        // Turnstile injects the token into a hidden input with this exact name
+        const el = doc?.querySelector('input[name="cf-turnstile-response"]');
+        if (!el) return null;
+        const val = (el as HTMLInputElement).value;
+        return typeof val === "string" && val.length > 20 ? val : null;
+      });
+      if (token) return token as string;
+    } catch {
+      // page may be navigating — just retry
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return null;
+}
+
+/**
+ * Inject a token obtained externally (Paxsenix) into the Turnstile hidden field
+ * and fire the input/change events the site's JS listens for, so the form sees
+ * a "solved" widget.
+ */
+async function injectToken(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  page: any,
+  token: string,
+): Promise<void> {
+  await page.evaluate((t: string) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const doc = (globalThis as any).document;
+    const el = doc?.querySelector('input[name="cf-turnstile-response"]');
+    if (el) {
+      (el as HTMLInputElement).value = t;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+  }, token);
+}
+
 async function createOneAccount(
   job: Job,
   index: number,
@@ -238,28 +292,68 @@ async function createOneAccount(
         // checkbox might not exist
       }
 
-      appendLog(job, `[${index}/${total}] 🧩 Solving Turnstile (Pax)...`);
-      const token = await solveTurnstile(REG_URL, SITE_KEY);
-      if (!token) {
-        appendLog(job, `[${index}/${total}] ❌ Captcha solve failed`);
-        await browser.close();
-        return null;
+      // ─── Turnstile: native-solve-first, external fallback ────────────────
+      appendLog(job, `[${index}/${total}] 🧩 Waiting for native Turnstile solve...`);
+      let token = await waitForNativeTurnstile(page, 30_000);
+
+      if (token) {
+        appendLog(job, `[${index}/${total}] ✅ Turnstile solved natively (${token.length} chars)`);
+      } else {
+        // Native solve timed out — the widget didn't auto-complete. Fall back
+        // to Paxsenix. This token may be rejected if Cloudflare enforces
+        // solver-IP == submit-IP correlation, but it's the only remaining path.
+        appendLog(job, `[${index}/${total}] ⏳ Native solve timed out, calling Paxsenix fallback...`);
+        token = await solveTurnstile(REG_URL, SITE_KEY);
+        if (!token) {
+          appendLog(job, `[${index}/${total}] ❌ Captcha solve failed (native + Paxsenix)`);
+          await browser.close();
+          return null;
+        }
+        await injectToken(page, token);
+        appendLog(job, `[${index}/${total}] ⚠️ Turnstile solved via Paxsenix fallback (${token.length} chars) — may be rejected if IPs mismatch`);
       }
-      appendLog(job, `[${index}/${total}] ✅ Turnstile solved`);
-      await page.evaluate((t: string) => {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const el = (globalThis as any).document?.getElementsByName?.("cf-turnstile-response")?.[0];
-        if (el) el.value = t;
-      }, token);
+      // ─────────────────────────────────────────────────────────────────────
 
       await new Promise((r) => setTimeout(r, 500));
-      await page.click('button[type="submit"]');
+
+      // Click submit AND capture the network response so we log the real
+      // reason if Cloudflare rejects the token (invalid-input-response,
+      // timeout-or-duplicate, missing-input-response, etc.).
+      let submitStatus = 0;
+      let submitBodySnippet = "";
+      try {
+        const [response] = await Promise.all([
+          page.waitForResponse(
+            (r: any) =>
+              typeof r.url === "function" &&
+              r.url().includes("/auth/register") &&
+              r.request().method() === "POST",
+            { timeout: 30_000 },
+          ),
+          page.click('button[type="submit"]'),
+        ]);
+        submitStatus = response.status();
+        try {
+          const text = await response.text();
+          submitBodySnippet = text.slice(0, 300).replace(/\s+/g, " ").trim();
+        } catch {
+          submitBodySnippet = "(could not read body)";
+        }
+        appendLog(
+          job,
+          `[${index}/${total}] 📡 Submit response: ${submitStatus} — ${submitBodySnippet}`,
+        );
+      } catch (e) {
+        appendLog(job, `[${index}/${total}] ⚠️ Submit response not captured: ${String(e).slice(0, 80)}`);
+        // Fallback: still click (in case waitForResponse raced with click)
+        try { await page.click('button[type="submit"]'); } catch { /* ignore */ }
+      }
 
       appendLog(job, `[${index}/${total}] 📩 Waiting for OTP...`);
       try {
         await page.waitForSelector('input[name="code"]', { timeout: 20_000 });
       } catch {
-        appendLog(job, `[${index}/${total}] ❌ OTP form not found`);
+        appendLog(job, `[${index}/${total}] ❌ OTP form not found (submit ${submitStatus})`);
         await browser.close();
         return null;
       }
