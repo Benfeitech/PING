@@ -6,13 +6,10 @@ import { logger } from "./logger";
 const REG_URL = "https://dashboard.katabump.com/auth/register";
 const SITE_KEY = "0x4AAAAAAA1IssKDXD0TRMjP";
 const MAX_CONCURRENT_BROWSERS = 1;
+const OTP_CHECKS = 40;              // was 20 — 40 × 3s = 120s, covers slow delivery
+const OTP_POLL_INTERVAL_MS = 3_000;
 
 // ─── Proxy pool ─────────────────────────────────────────────────────────────
-// Every account-creation flow picks ONE random proxy from this pool and runs
-// the whole browser session through it, so all Katabump requests (page loads,
-// Turnstile, OTP, security-check captcha, form submit) originate from a
-// randomized IP. Retries in runJob() call createOneAccount() again, so each
-// retry naturally gets a fresh random IP as well.
 interface ProxyConfig {
   label: string;
   server: string;
@@ -22,39 +19,13 @@ interface ProxyConfig {
 
 const PROXY_SERVER = "http://dc.oxylabs.io:8000";
 const PROXIES: ProxyConfig[] = [
-  {
-    label: "oxylabs-1",
-    server: PROXY_SERVER,
-    username: "user-gsigis53875_oGmVP-country-US",
-    password: "I624pa5U1VP_RIOY",
-  },
-  {
-    label: "oxylabs-2",
-    server: PROXY_SERVER,
-    username: "user-benfeiproxy1_N3Vvw-country-US",
-    password: "Gdiyavaksg2usgshsi+",
-  },
-  {
-    label: "oxylabs-3",
-    server: PROXY_SERVER,
-    username: "user-benfeiproxy2_GR3FX-country-US",
-    password: "Oshhsuhe+7377gdid",
-  },
-  {
-    label: "oxylabs-4",
-    server: PROXY_SERVER,
-    username: "user-benfeiproxy3_EL6lL-country-US",
-    password: "Gsiyg+36uhdisuvs",
-  },
-  {
-    label: "oxylabs-5",
-    server: PROXY_SERVER,
-    username: "user-benfeiproxy4_RoMBf-country-US",
-    password: "hsoygssoyg+36gGs",
-  },
+  { label: "oxylabs-1", server: PROXY_SERVER, username: "user-gsigis53875_oGmVP-country-US", password: "I624pa5U1VP_RIOY" },
+  { label: "oxylabs-2", server: PROXY_SERVER, username: "user-benfeiproxy1_N3Vvw-country-US", password: "Gdiyavaksg2usgshsi+" },
+  { label: "oxylabs-3", server: PROXY_SERVER, username: "user-benfeiproxy2_GR3FX-country-US", password: "Oshhsuhe+7377gdid" },
+  { label: "oxylabs-4", server: PROXY_SERVER, username: "user-benfeiproxy3_EL6lL-country-US", password: "Gsiyg+36uhdisuvs" },
+  { label: "oxylabs-5", server: PROXY_SERVER, username: "user-benfeiproxy4_RoMBf-country-US", password: "hsoygssoyg+36gGs" },
 ];
 
-/** Pick a random proxy from the pool for one account-creation flow. */
 function pickProxy(): ProxyConfig {
   return PROXIES[Math.floor(Math.random() * PROXIES.length)];
 }
@@ -74,7 +45,6 @@ export interface Job {
   cancelRequested?: boolean;
 }
 
-/** Request graceful cancellation of a running job. Returns false if not found. */
 export function stopJob(jobId: string): boolean {
   const job = jobs.get(jobId);
   if (!job) return false;
@@ -85,7 +55,6 @@ export function stopJob(jobId: string): boolean {
   return true;
 }
 
-// In-memory job store — ephemeral, no DB needed
 export const jobs = new Map<string, Job>();
 
 function genPassword(): string {
@@ -100,8 +69,7 @@ function appendLog(job: Job, line: string): void {
 /**
  * Wait up to `timeoutMs` for Cloudflare's Turnstile widget to solve natively.
  * Native solve is best because the token is bound to the SAME IP / UA / session
- * as the form submission. Returns the token, or null if the widget never filled
- * the hidden field in time.
+ * as the form submission.
  */
 async function waitForNativeTurnstile(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -114,7 +82,6 @@ async function waitForNativeTurnstile(
       const token = await page.evaluate(() => {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const doc = (globalThis as any).document;
-        // Turnstile injects the token into a hidden input with this exact name
         const el = doc?.querySelector('input[name="cf-turnstile-response"]');
         if (!el) return null;
         const val = (el as HTMLInputElement).value;
@@ -129,11 +96,6 @@ async function waitForNativeTurnstile(
   return null;
 }
 
-/**
- * Inject a token obtained externally (Paxsenix) into the Turnstile hidden field
- * and fire the input/change events the site's JS listens for, so the form sees
- * a "solved" widget.
- */
 async function injectToken(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   page: any,
@@ -171,7 +133,6 @@ async function createOneAccount(
   if (job.cancelRequested) return null;
   activeBrowsers++;
 
-  // Pick a random proxy for THIS account-creation flow only.
   const proxy = pickProxy();
 
   try {
@@ -184,10 +145,11 @@ async function createOneAccount(
 
     const { email, token: mailToken, name } = mailResult;
     const password = genPassword();
+    const emailDomain = email.split("@")[1] ?? "unknown";
     appendLog(job, `[${index}/${total}] 📧 ${email}`);
     appendLog(job, `[${index}/${total}] 🌍 Proxy: ${proxy.label}`);
+    appendLog(job, `[${index}/${total}] 📮 Email domain: ${emailDomain}`);
 
-    // Use playwright-extra + stealth to bypass Cloudflare bot detection
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let chromiumExtra: any;
     try {
@@ -204,7 +166,6 @@ async function createOneAccount(
 
     const browser = await chromiumExtra.launch({
       headless: true,
-      // Route the entire browser session through the randomly-picked proxy.
       proxy: {
         server: proxy.server,
         username: proxy.username,
@@ -220,21 +181,13 @@ async function createOneAccount(
     const page = await browser.newPage();
 
     try {
-      // Determine the referral code. The ref link (e.g. rl.katabump.fr/ae49f4)
-      // redirects to dashboard.katabump.com/auth/login#<code>. The site JS reads
-      // location.hash and stores it as a `referral` cookie. We must load the
-      // register page WITH that hash so the cookie is set before we submit.
+      // ─── Referral code resolution ───────────────────────────────────────
       let refCode = "";
       try {
         const u = new URL(refUrl);
         refCode = u.pathname.split("/").filter(Boolean).pop() ?? "";
-      } catch {
-        // fall back to hash detection below
-      }
+      } catch { /* fall through to hash detection */ }
 
-      // Only pre-visit the referral link if we couldn't get the code from the
-      // URL path (the pre-visit is a whole extra navigation). Normally the path
-      // already gives us the code, so we skip straight to the register page.
       if (!refCode) {
         appendLog(job, `[${index}/${total}] 🔗 Visiting referral link...`);
         try {
@@ -243,13 +196,10 @@ async function createOneAccount(
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const hash: string = await page.evaluate(() => (globalThis as any).location?.hash ?? "");
           if (hash && hash.length > 1) refCode = hash.slice(1);
-        } catch {
-          // referral URL errors are ok — we still have refCode from the path
-        }
+        } catch { /* referral URL errors are ok */ }
       }
       appendLog(job, `[${index}/${total}] 🎫 Referral code: ${refCode || "(none)"}`);
 
-      // Load the register page WITH the ref hash so its JS sets the referral cookie
       appendLog(job, `[${index}/${total}] 🌐 Loading registration page...`);
       await page.goto(`${REG_URL}${refCode ? "#" + refCode : ""}`, {
         timeout: 40_000,
@@ -257,51 +207,37 @@ async function createOneAccount(
       });
       await new Promise((r) => setTimeout(r, 600));
 
-      // Confirm the referral cookie is set (so the account is actually credited)
+      // ─── Referral cookie check ──────────────────────────────────────────
       try {
         const cookies = await page.context().cookies();
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const refCookie = cookies.find((c: any) => c.name === "referral");
-        appendLog(
-          job,
-          `[${index}/${total}] 🍪 Referral cookie: ${refCookie ? refCookie.value : "NOT SET ⚠️"}`,
-        );
+        appendLog(job, `[${index}/${total}] 🍪 Referral cookie: ${refCookie ? refCookie.value : "NOT SET ⚠️"}`);
         if (!refCookie && refCode) {
-          // Force-set it if the site JS did not (belt and suspenders)
-          await page.context().addCookies([
-            {
-              name: "referral",
-              value: refCode,
-              domain: "dashboard.katabump.com",
-              path: "/",
-            },
-          ]);
+          await page.context().addCookies([{
+            name: "referral",
+            value: refCode,
+            domain: "dashboard.katabump.com",
+            path: "/",
+          }]);
           appendLog(job, `[${index}/${total}] 🍪 Referral cookie force-set to ${refCode}`);
         }
-      } catch {
-        // cookie inspection is best-effort
-      }
+      } catch { /* cookie inspection is best-effort */ }
 
+      // ─── Fill form ──────────────────────────────────────────────────────
       await page.fill('input[name="firstname"]', name.first);
       await page.fill('input[name="lastname"]', name.last);
       await page.fill('input[name="email"]', email);
       await page.fill('input[name="password"]', password);
-      try {
-        await page.click('input[type="checkbox"]');
-      } catch {
-        // checkbox might not exist
-      }
+      try { await page.click('input[type="checkbox"]'); } catch { /* may not exist */ }
 
-      // ─── Turnstile: native-solve-first, external fallback ────────────────
+      // ─── Turnstile: native-solve-first, external fallback ───────────────
       appendLog(job, `[${index}/${total}] 🧩 Waiting for native Turnstile solve...`);
       let token = await waitForNativeTurnstile(page, 30_000);
 
       if (token) {
         appendLog(job, `[${index}/${total}] ✅ Turnstile solved natively (${token.length} chars)`);
       } else {
-        // Native solve timed out — the widget didn't auto-complete. Fall back
-        // to Paxsenix. This token may be rejected if Cloudflare enforces
-        // solver-IP == submit-IP correlation, but it's the only remaining path.
         appendLog(job, `[${index}/${total}] ⏳ Native solve timed out, calling Paxsenix fallback...`);
         token = await solveTurnstile(REG_URL, SITE_KEY);
         if (!token) {
@@ -312,13 +248,10 @@ async function createOneAccount(
         await injectToken(page, token);
         appendLog(job, `[${index}/${total}] ⚠️ Turnstile solved via Paxsenix fallback (${token.length} chars) — may be rejected if IPs mismatch`);
       }
-      // ─────────────────────────────────────────────────────────────────────
 
       await new Promise((r) => setTimeout(r, 500));
 
-      // Click submit AND capture the network response so we log the real
-      // reason if Cloudflare rejects the token (invalid-input-response,
-      // timeout-or-duplicate, missing-input-response, etc.).
+      // ─── Submit + capture response ──────────────────────────────────────
       let submitStatus = 0;
       let submitBodySnippet = "";
       try {
@@ -337,59 +270,99 @@ async function createOneAccount(
           const text = await response.text();
           submitBodySnippet = text.slice(0, 300).replace(/\s+/g, " ").trim();
         } catch {
-          submitBodySnippet = "(could not read body)";
+          submitBodySnippet = "(could not read body — likely a redirect)";
         }
-        appendLog(
-          job,
-          `[${index}/${total}] 📡 Submit response: ${submitStatus} — ${submitBodySnippet}`,
-        );
+        appendLog(job, `[${index}/${total}] 📡 Submit response: ${submitStatus} — ${submitBodySnippet}`);
       } catch (e) {
         appendLog(job, `[${index}/${total}] ⚠️ Submit response not captured: ${String(e).slice(0, 80)}`);
-        // Fallback: still click (in case waitForResponse raced with click)
         try { await page.click('button[type="submit"]'); } catch { /* ignore */ }
       }
 
-      appendLog(job, `[${index}/${total}] 📩 Waiting for OTP...`);
-      try {
-        await page.waitForSelector('input[name="code"]', { timeout: 20_000 });
-      } catch {
-        appendLog(job, `[${index}/${total}] ❌ OTP form not found (submit ${submitStatus})`);
+      // Give the browser a moment to follow any 302 redirects
+      await new Promise((r) => setTimeout(r, 1_500));
+
+      // ─── OTP diagnostics ────────────────────────────────────────────────
+      const finalUrl = page.url();
+      appendLog(job, `[${index}/${total}] 🧭 Final URL after submit: ${finalUrl}`);
+
+      const otpInputCount = await page.locator('input[name="code"]').count().catch(() => 0);
+      const stillOnRegister = finalUrl.includes("/auth/register");
+      const errorTextOnPage = await page
+        .locator(".error, .alert, [role='alert'], .text-red-500, .text-danger")
+        .first()
+        .textContent({ timeout: 500 })
+        .catch(() => "");
+
+      appendLog(job, `[${index}/${total}] 🔎 OTP input present: ${otpInputCount > 0 ? "YES" : "NO"}`);
+      if (errorTextOnPage && errorTextOnPage.trim()) {
+        appendLog(job, `[${index}/${total}] 🚨 Page error text: ${errorTextOnPage.trim().slice(0, 200)}`);
+      }
+
+      // If we bounced back to /auth/register, the form was rejected — no OTP was sent
+      if (stillOnRegister && otpInputCount === 0) {
+        appendLog(
+          job,
+          `[${index}/${total}] ❌ Form rejected — still on /auth/register. ` +
+            `Likely causes: disposable domain (${emailDomain}) blocked, or Turnstile token rejected.`,
+        );
         await browser.close();
         return null;
       }
 
+      // ─── Wait for OTP input ─────────────────────────────────────────────
+      appendLog(job, `[${index}/${total}] 📩 Waiting for OTP form...`);
+      try {
+        await page.waitForSelector('input[name="code"]', { timeout: 20_000 });
+      } catch {
+        appendLog(
+          job,
+          `[${index}/${total}] ❌ OTP form not found (submit=${submitStatus}, url=${finalUrl})`,
+        );
+        await browser.close();
+        return null;
+      }
+
+      // ─── Poll mailbox for OTP ───────────────────────────────────────────
       let foundOTP: string | null = null;
-      for (let check = 1; check <= 20; check++) {
+      let mailboxEmptyChecks = 0;
+      for (let check = 1; check <= OTP_CHECKS; check++) {
         if (job.cancelRequested) { await browser.close(); return null; }
         foundOTP = await getOTPFromMailTm(mailToken, email);
         if (foundOTP) {
           appendLog(job, `[${index}/${total}] 🔑 OTP: ${foundOTP}`);
           break;
         }
-        appendLog(job, `[${index}/${total}] ⏳ OTP check ${check}/20...`);
-        await new Promise((r) => setTimeout(r, 3_000));
+        mailboxEmptyChecks++;
+        // Log every 5th check to reduce noise
+        if (check === 1 || check % 5 === 0 || check === OTP_CHECKS) {
+          appendLog(job, `[${index}/${total}] ⏳ OTP check ${check}/${OTP_CHECKS}...`);
+        }
+        await new Promise((r) => setTimeout(r, OTP_POLL_INTERVAL_MS));
       }
 
       if (!foundOTP) {
-        appendLog(job, `[${index}/${total}] ❌ OTP timed out`);
+        appendLog(
+          job,
+          `[${index}/${total}] ❌ OTP timed out after ${OTP_CHECKS * (OTP_POLL_INTERVAL_MS / 1000)}s. ` +
+            `If the OTP page rendered correctly, the email likely never arrived — ` +
+            `domain "${emailDomain}" may be silently dropped by Katabump's mailer. ` +
+            `Try a different temp-mail provider (mail.gw, custom-domain catch-all).`,
+        );
         await browser.close();
         return null;
       }
 
+      // ─── Enter OTP ──────────────────────────────────────────────────────
       await page.fill('input[name="code"]', foundOTP);
       await page.click('button[type="submit"]');
       await new Promise((r) => setTimeout(r, 2_000));
 
-      // Post-OTP "Security check": distorted image captcha that must be solved
-      // before the account is actually created. Read it with Gemini vision OCR,
-      // retrying with a fresh captcha (page reload / Regenerate) on a misread.
+      // ─── Post-OTP security captcha (image OCR) ──────────────────────────
       let securityCheck = false;
       try {
         await page.waitForSelector("#captcha_code", { timeout: 20_000 });
         securityCheck = true;
-      } catch {
-        // No security check — older flow, account already created
-      }
+      } catch { /* no security check — older flow */ }
 
       if (securityCheck) {
         appendLog(job, `[${index}/${total}] 🛡️ Solving security check...`);
@@ -397,9 +370,7 @@ async function createOneAccount(
         const MAX_SEC_ATTEMPTS = 8;
         for (let attempt = 1; attempt <= MAX_SEC_ATTEMPTS && !passed; attempt++) {
           if (job.cancelRequested) { await browser.close(); return null; }
-          // The page may have reloaded a fresh captcha after a rejection, so
-          // wait for the image each loop. If it's missing, regenerate & retry
-          // instead of abandoning the whole account.
+
           try {
             await page.waitForSelector("#captcha-image", { timeout: 8_000 });
           } catch {
@@ -409,9 +380,6 @@ async function createOneAccount(
             continue;
           }
 
-          // Fetch the ACTUAL image bytes from the element's src (via in-page
-          // fetch so cookies/session are sent). element.screenshot() returns a
-          // blank box on these lazy-loaded captcha images, so OCR always failed.
           const dataUrl: string | null = await page.evaluate(async () => {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const doc = (globalThis as any).document;
@@ -427,9 +395,7 @@ async function createOneAccount(
                 reader.onerror = rej;
                 reader.readAsDataURL(blob);
               });
-            } catch {
-              return null;
-            }
+            } catch { return null; }
           });
 
           const b64 = dataUrl?.split(",")[1];
@@ -447,17 +413,12 @@ async function createOneAccount(
           await page.fill("#captcha_code", code);
           await page.click("#captcha-btn");
 
-          // Success = captcha input detaches. Resolves the instant it passes
-          // instead of waiting a fixed 4s every time.
           const passedNow = await page
             .waitForSelector("#captcha_code", { state: "detached", timeout: 3_000 })
             .then(() => true)
             .catch(() => false);
-          if (passedNow) {
-            passed = true;
-            break;
-          }
-          // Rejected — ask for a fresh captcha image before the next attempt.
+          if (passedNow) { passed = true; break; }
+
           appendLog(job, `[${index}/${total}] ↻ Captcha rejected (try ${attempt}), regenerating...`);
           await page.click("#refresh-captcha").catch(() => {});
           await new Promise((r) => setTimeout(r, 600));
@@ -490,8 +451,6 @@ export async function runJob(job: Job): Promise<void> {
     job.status = "running";
     appendLog(job, `🚀 Starting ${job.count} account(s) — running one at a time`);
 
-    // Fire all accounts concurrently; the semaphore inside createOneAccount
-    // ensures at most MAX_CONCURRENT_BROWSERS browsers run at the same time.
     await Promise.all(
       Array.from({ length: job.count }, (_, idx) => idx + 1).map(async (i) => {
         if (job.cancelRequested) return;
